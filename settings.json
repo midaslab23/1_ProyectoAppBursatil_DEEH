@@ -1,0 +1,6 @@
+{
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "python.defaultInterpreterPath": "C:/Users/dimex/anaconda3/envs/finapp_clean/python.exe",
+  "terminal.integrated.activateEnvironment": true
+}
+
