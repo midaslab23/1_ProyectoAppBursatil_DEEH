@@ -3,14 +3,16 @@ import streamlit as st
 # streamlit_app_finanzas.py
 # Aplicación Streamlit modular para análisis financiero
 # Módulo inicial: Selección de acciones + rango de fechas + periodicidad + validación de datos
+from matplotlib.lines import Line2D
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime
 import matplotlib.pyplot as plt
 import mplfinance as mpf
-from ta.trend import SMAIndicator, EMAIndicator, MACD
-from ta.momentum import RSIIndicator
+from ta.volume import OnBalanceVolumeIndicator
+from ta.trend import SMAIndicator, EMAIndicator, MACD, CCIIndicator, ADXIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator
 
 # -------------------- CONFIG / Parámetros globales (fácil de editar) --------------------
 CONFIG = {
@@ -129,9 +131,6 @@ def main():
         st.info("Módulo de pronóstico ML no implementado (próximamente). Puedo crear plantillas: features, train/test etc.")
 
 # -------------------- Módulo: Análisis técnico --------------------
-
-
-
 def render_technical_module(start_date, end_date, periodicity):
     st.title("Análisis técnico")
     st.write("Selecciona las acciones que quieres analizar, el rango de fechas y la periodicidad. La app validará si hay suficientes datos.")
@@ -357,45 +356,140 @@ def render_technical_module(start_date, end_date, periodicity):
 
         df_ind["RSI"] = RSIIndicator(close_series, window=14).rsi()
 
-        # Preparar addplots (usar df_ind index alineado con dft)
-        apds = [
-            mpf.make_addplot(df_ind[f"SMA_{sma_short}"], color='#EDF67D', width=0.8),
-            mpf.make_addplot(df_ind[f"SMA_{sma_med}"],   color='#CA7DF9', width=0.8),
-            mpf.make_addplot(df_ind[f"SMA_{sma_long}"],  color='#40F7DF', width=0.8),
+                # ------------------ Añadir Ichimoku, ADX y Stochastic + mejorar leyendas ------------------
+        # Asegurarnos de series necesarias
+        high = dft['High']
+        low = dft['Low']
+        vol = dft['Volume'] if 'Volume' in dft.columns else None
 
-            mpf.make_addplot(df_ind["MACD"], panel=1, color='fuchsia', width=0.9),
-            mpf.make_addplot(df_ind["MACD_signal"], panel=1, color='gold', width=0.9),
-            mpf.make_addplot(df_ind["MACD_diff"], panel=1, type='bar', color='gray', alpha=0.5),
+        # Parámetros Ichimoku / otros
+        tenkan_window, kijun_window, senkou_b_window, senkou_shift = 9, 26, 52, 26
+        stoch_window, stoch_smooth = 14, 3
+        cci_window = 20
+        adx_window = 14
 
-            mpf.make_addplot(df_ind["RSI"], panel=2, color='yellow', width=0.9),
+        # Calcular Ichimoku
+        tenkan = (high.rolling(window=tenkan_window).max() + low.rolling(window=tenkan_window).min()) / 2
+        kijun  = (high.rolling(window=kijun_window).max() + low.rolling(window=kijun_window).min()) / 2
+        senkou_a = ((tenkan + kijun) / 2).shift(senkou_shift)
+        senkou_b = ((high.rolling(window=senkou_b_window).max() + low.rolling(window=senkou_b_window).min()) / 2).shift(senkou_shift)
+        chikou = close_series.shift(-(senkou_shift))
+
+        df_ind["ICH_Tenkan"] = tenkan
+        df_ind["ICH_Kijun"]  = kijun
+        df_ind["ICH_Senkou_A"] = senkou_a
+        df_ind["ICH_Senkou_B"] = senkou_b
+        df_ind["ICH_Chikou"] = chikou
+
+        # Stochastic
+        stoch = StochasticOscillator(high=high, low=low, close=close_series,
+                                    window=stoch_window, smooth_window=stoch_smooth)
+        df_ind["STOCH_k"] = stoch.stoch()
+        df_ind["STOCH_d"] = stoch.stoch_signal()
+
+        # CCI, ADX, OBV (si aún no calculaste)
+        df_ind["CCI"] = CCIIndicator(high=high, low=low, close=close_series, window=cci_window).cci()
+        df_ind["ADX"] = ADXIndicator(high=high, low=low, close=close_series, window=adx_window).adx()
+        #if vol is not None:
+        df_ind["OBV"] = OnBalanceVolumeIndicator(close=close_series, volume=vol).on_balance_volume()
+
+        # Construir addplots
+        apds = []
+
+        # SMAs y Ichimoku lines (panel 0)
+        apds += [
+            mpf.make_addplot(df_ind.get(f"SMA_{sma_short}"), panel=0, color='#EDF67D', width=0.8, label=f"SMA short {sma_short}"),
+            mpf.make_addplot(df_ind.get(f"SMA_{sma_med}"), panel=0, color='#CA7DF9', width=0.8,label=f"SMA med {sma_med}"),
+            mpf.make_addplot(df_ind.get(f"SMA_{sma_long}"), panel=0, color='#40F7DF', width=0.8,label=f"SMA long {sma_long}"),
+            mpf.make_addplot(df_ind.get("ICH_Tenkan"), panel=0, color='lime', width=0.9),
+            mpf.make_addplot(df_ind.get("ICH_Kijun"),  panel=0, color='lightcoral', width=0.9),
+            mpf.make_addplot(df_ind.get("ICH_Senkou_A"), panel=0, color='lightgreen', width=1.0, label='ICH Senkou A'),
+            mpf.make_addplot(df_ind.get("ICH_Senkou_B"), panel=0, color='red', width=1.0, label='ICH Senkou B'),
+            # Chikou (lagging) como línea en panel 0
+            #mpf.make_addplot(df_ind.get("ICH_Chikou"), panel=0, color='cyan', width=0.1),
         ]
 
-        mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', rc={'figure.facecolor':'#222222'})
+        # MACD (panel 1)
+        apds += [
+            mpf.make_addplot(df_ind.get("MACD"), panel=1, color='fuchsia', width=0.9, label='MACD'),
+            mpf.make_addplot(df_ind.get("MACD_signal"), panel=1, color='gold', width=0.9,label='Signal'),
+            mpf.make_addplot(df_ind.get("MACD_diff"), panel=1, type='bar', color='gray', alpha=0.6,label='MACD hist')
+        ]
 
+        # RSI + ADX en el mismo panel (panel 2)
+        apds += [
+            mpf.make_addplot(df_ind.get("RSI"), panel=2, color='yellow', width=0.9,label="RSI"),
+            mpf.make_addplot(df_ind.get("ADX"), panel=2, color='lime', width=0.9,label="ADX"),
+        ]
+
+        # Stochastic + CCI en panel 3
+        apds += [
+            mpf.make_addplot(df_ind.get("STOCH_k"), panel=3, color='lime', width=0.9, label=''),
+            mpf.make_addplot(df_ind.get("STOCH_d"), panel=3, color='magenta', width=0.9, label='Stoch %D'),
+            mpf.make_addplot(df_ind.get("CCI"), panel=3, color='purple', width=0.9, label='CCI'),
+        ]
+
+        apds += [ mpf.make_addplot(df_ind.get("OBV"), panel=4, color='silver', label='OBV')]
+
+        # Estilo
+        mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds' if 'nightclouds' in mpf.available_styles() else 'yahoo',
+                                    rc={'figure.facecolor': '#222222', 'axes.facecolor': '#222222'})
+
+        # Panel ratios: main, macd, rsi/adx, stoch/cci
+        panel_ratios = (6, 2, 2, 2, 2)  # añadir más si hay más paneles
+
+        # Plotear y recuperar figuras/axes
         try:
-            fig, _ = mpf.plot(
+            fig, axes = mpf.plot(
                 dft,
                 type='candle',
                 style=mpf_style,
                 addplot=apds,
-                volume='Volume' in dft.columns,
-                panel_ratios=(6,2,2),
-                figsize=(14,9),
-                title=f"{t} — Candles + SMAs + MACD + RSI",
+                volume=('Volume' in dft.columns),
+                panel_ratios=panel_ratios,
+                figsize=(14, 10),
+                title=f"{t} — Candles + SMAs + Ichimoku + MACD + RSI + Stoch + CCI",
                 tight_layout=True,
                 returnfig=True
             )
+
+            # axes es lista; ax_price = axes[0]; otros ax = axes[1], axes[2], ...
+            ax_price = axes[0]
+
+            # Pintar la nube Ichimoku (SenkouA/SenkouB) sobre ax_price (solo donde ambas series no-nulas)
+            sa = df_ind.get("ICH_Senkou_A")
+            sb = df_ind.get("ICH_Senkou_B")
+            if sa is not None and sb is not None:
+                mask_valid = (~sa.isna()) & (~sb.isna())
+                if mask_valid.any():
+                    ax_price.fill_between(dft.index, sa, sb,
+                                        where=(mask_valid & (sa >= sb)),
+                                        interpolate=True, color='lightgreen', alpha=0.12)
+                    ax_price.fill_between(dft.index, sa, sb,
+                                        where=(mask_valid & (sa < sb)),
+                                        interpolate=True, color='lightcoral', alpha=0.12)
+
+            # Intentar añadir leyendas en cada panel (siempre que existan handles)
+            try:
+                for ax in axes:
+                    handles, labels = ax.get_legend_handles_labels()
+                    if handles:
+                        ax.legend(handles, labels, loc='upper left', fontsize='small', framealpha=0.6)
+            except Exception:
+                pass
+
+            # Mostrar en Streamlit
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
+
         except Exception as e:
             st.error(f"{t}: error al graficar con mplfinance: {e}")
-            fig, ax = plt.subplots(figsize=(12,4))
-            ax.plot(close_series.index, close_series.values)
+            # fallback: gráfico simple de close
+            fig, ax = plt.subplots(figsize=(12, 4))
+            ax.plot(close_series.index, close_series.values, linewidth=1.6)
             ax.set_title(f"{t} — Precio (fallback)")
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
-
-
 
         with st.expander("Ver datos (primeras filas)"):
             st.dataframe(dft.head())
