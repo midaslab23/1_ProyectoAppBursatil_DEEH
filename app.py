@@ -44,8 +44,9 @@ def local_css():
     .stButton>button, .stDownloadButton>button {{ background: linear-gradient(90deg, {t['accent_blue']} 0%, {t['accent_neon']} 100%); color: #001; border-radius: 8px; padding: 8px 12px; font-weight:600; }}
     .stTextInput>div>div>input, .stDateInput>div>div>input, .stSelectbox>div>div>div {{ background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); color: {t['text']}; border-radius:6px; padding:6px; }}
 
+
     /* Headers */
-    h1, h2, h3 {{ color: {t['accent_blue']}; font-family: 'Segoe UI', Roboto, Arial, sans-serif; }}
+    h1, h2, h3 {{ color: {t['accent_blue']}; font-family: Merriweather, Playfair Display, Lato, Open Sans; }}
 
     /* Make dataframes easier to read */
     .stDataFrame table {{ background-color: transparent !important; color: {t['text']} !important; }}
@@ -58,7 +59,7 @@ def local_css():
 
 #
 st.set_page_config(
-    page_title="Finanzas - App Modular",
+    page_title="App Financiera - Proyecto Midas",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -106,6 +107,7 @@ def main():
     default_tickers = st.sidebar.text_input("Tickers por defecto (coma-separados)", ",".join(CONFIG['DEFAULT_TICKERS']))
     ticker_list_input = st.sidebar.text_input("Ingresar tickers (coma-separados)", ",".join(CONFIG['DEFAULT_TICKERS']))
     st.sidebar.write("Tip: usar símbolos de Yahoo Finance, p.ej. AMXL.MX, WALMEX.MX")
+    
 
     # Guardamos en session_state para que otros módulos puedan leerlo si se implementan
     if 'global_params' not in st.session_state:
@@ -119,16 +121,27 @@ def main():
     end_date = st.sidebar.date_input("End date", today)
     periodicity = st.sidebar.selectbox("Periodicidad", ["Daily", "Weekly", "Monthly"], index=0)
 
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Interfaz modular, parámetros principales arriba. Cada módulo es independiente y usa parámetros comunes.")
+    st.sidebar.markdown("""
+**Elaborado por:**<br>
+**Diego Eduardo Enríquez Hernández**<br><br>
+<a href="https://www.linkedin.com/in/diegoeduardoenriquezhernandez/" target="_blank">
+    <img src="https://cdn-icons-png.flaticon.com/512/174/174857.png" width="26" style="vertical-align:middle"/>
+    &nbsp; Ver perfil en LinkedIn
+</a><br><br>
+**Economics · ML/Data Science · Finance**
+""", unsafe_allow_html=True)
+    
+
+    
+
 
     # Main area: renderizamos según módulo
     if module == "Análisis técnico":
         render_technical_module(start_date, end_date, periodicity)
     elif module == "Optimización + Simulación":
-        st.info("Módulo de optimización y simulación todavía no implementado. ¿Quieres que lo haga ahora?")
+        st.info("Módulo de optimización y simulación todavía no implementado")
     elif module == "Pronóstico ML":
-        st.info("Módulo de pronóstico ML no implementado (próximamente). Puedo crear plantillas: features, train/test etc.")
+        st.info("Módulo de pronóstico ML aún no implementado (próximamente)")
 
 # -------------------- Módulo: Análisis técnico --------------------
 def render_technical_module(start_date, end_date, periodicity):
@@ -393,6 +406,159 @@ def render_technical_module(start_date, end_date, periodicity):
         #if vol is not None:
         df_ind["OBV"] = OnBalanceVolumeIndicator(close=close_series, volume=vol).on_balance_volume()
 
+        #RECOMENDACIONES-----------------
+        # ------------------ Señales simples (reglas condicionales, UX) ------------------
+        def generate_simple_signals(df_ind, close_series, sma_short, sma_med, sma_long):
+            """
+            Devuelve (signal_label, confidence_text, bullets_list)
+            signal_label: 'buy'|'sell'|'neutral'
+            confidence_text: 'Alta / Media / Baja' (heurística)
+            bullets_list: lista de strings con explicaciones cortas
+            """
+            bulls = 0
+            bears = 0
+            notes = []
+
+            # último precio
+            try:
+                price = float(close_series.iloc[-1])
+            except Exception:
+                return "neutral", "Sin datos", ["No hay precio válido para generar señales."]
+
+            # SMA checks
+            for name, window in [(f"SMA_{sma_short}", sma_short), (f"SMA_{sma_med}", sma_med), (f"SMA_{sma_long}", sma_long)]:
+                series = df_ind.get(name)
+                if series is not None and len(series.dropna()) > 0:
+                    val = float(series.dropna().iloc[-1])
+                    if price > val:
+                        bulls += 1
+                        notes.append(f"Precio por encima de {name} ({window}) — sesgo alcista.")
+                    else:
+                        bears += 1
+                        notes.append(f"Precio por debajo de {name} ({window}) — sesgo bajista.")
+
+            # Ichimoku (Tenkan/Kijun/Senkou)
+            ten = df_ind.get("ICH_Tenkan")
+            kij = df_ind.get("ICH_Kijun")
+            sa  = df_ind.get("ICH_Senkou_A")
+            sb  = df_ind.get("ICH_Senkou_B")
+            if ten is not None and kij is not None:
+                tval = float(ten.dropna().iloc[-1]) if len(ten.dropna())>0 else None
+                kval = float(kij.dropna().iloc[-1]) if len(kij.dropna())>0 else None
+                if tval and kval:
+                    if price > max(tval, kval):
+                        bulls += 1
+                        notes.append("Precio por encima de Tenkan/Kijun — momentum alcista.")
+                    elif price < min(tval, kval):
+                        bears += 1
+                        notes.append("Precio por debajo de Tenkan/Kijun — momentum bajista.")
+                    else:
+                        notes.append("Precio entre Tenkan y Kijun — posible consolidación.")
+
+            # Kumo (Senkou A/B): nube alcista si A > B
+            if sa is not None and sb is not None and len(sa.dropna())>0 and len(sb.dropna())>0:
+                a = float(sa.dropna().iloc[-1])
+                b = float(sb.dropna().iloc[-1])
+                if a > b and price > a:
+                    bulls += 1
+                    notes.append("En / sobre nube (SenkouA > SenkouB) — tendencia alcista respaldada por Kumo.")
+                elif a < b and price < b:
+                    bears += 1
+                    notes.append("Por debajo de la nube (SenkouA < SenkouB) — tendencia bajista.")
+                else:
+                    notes.append("Nube neutra o precio dentro de la nube — señal débil.")
+
+            # MACD (momentum)
+            macd = df_ind.get("MACD")
+            macd_sig = df_ind.get("MACD_signal")
+            if macd is not None and macd_sig is not None and len(macd.dropna())>1 and len(macd_sig.dropna())>1:
+                m = float(macd.dropna().iloc[-1])
+                s = float(macd_sig.dropna().iloc[-1])
+                if m > s:
+                    bulls += 1
+                    notes.append("MACD > señal — momentum alcista.")
+                else:
+                    bears += 1
+                    notes.append("MACD < señal — momentum bajista.")
+
+            # RSI (sobrecompra/sobreventa)
+            rsi = df_ind.get("RSI")
+            if rsi is not None and len(rsi.dropna())>0:
+                r = float(rsi.dropna().iloc[-1])
+                if r < 30:
+                    bulls += 1
+                    notes.append(f"RSI {r:.0f} — condición de sobreventa (posible rebote).")
+                elif r > 70:
+                    bears += 1
+                    notes.append(f"RSI {r:.0f} — condición de sobrecompra (posible corrección).")
+                else:
+                    notes.append(f"RSI {r:.0f} — neutro.")
+
+            # ADX (fuerza de la tendencia)
+            adx = df_ind.get("ADX")
+            adx_strength = None
+            if adx is not None and len(adx.dropna())>0:
+                a = float(adx.dropna().iloc[-1])
+                adx_strength = a
+                if a >= 25:
+                    notes.append(f"ADX {a:.0f} — tendencia fuerte.")
+                else:
+                    notes.append(f"ADX {a:.0f} — tendencia débil / rango.")
+
+            # Score
+            score = bulls - bears
+            if score >= 2:
+                label = "buy"
+                conf = "Alta" if adx_strength and adx_strength >= 25 else "Media"
+            elif score <= -2:
+                label = "sell"
+                conf = "Alta" if adx_strength and adx_strength >= 25 else "Media"
+            else:
+                label = "neutral"
+                conf = "Baja"
+
+            # Resumen breve (3 bullets máximo)
+            summary = []
+            # Priorizar items sintéticos primero
+            if label == "buy":
+                summary.append("Sesgo técnico: ALCISTA")
+            elif label == "sell":
+                summary.append("Sesgo técnico: BAJISTA")
+            else:
+                summary.append("Sesgo técnico: NEUTRO / Esperar confirmación")
+
+            # añadir 2 líneas explicativas más
+            for n in notes[:7]:
+                summary.append(n)
+
+            return label, conf, summary
+
+        # Generar y mostrar la señal (se coloca antes de plotting)
+        signal_label, confidence, explanation = generate_simple_signals(df_ind, close_series, sma_short, sma_med, sma_long)
+
+        # Mostrar UI amigable y NO-ASESORAMIENTO
+        with st.container():
+            st.markdown("### Señales Técnicas")
+            if signal_label == "buy":
+                st.success(f"⚒️ Señal: COMPRA  — Confianza: {confidence}")
+            elif signal_label == "sell":
+                st.error(f"🛑 Señal: VENTA  — Confianza: {confidence}")
+            else:
+                st.info(f"⚪ Señal: NEUTRA/ESPERAR  — Confianza: {confidence}")
+
+            # bullets explicativos
+            for b in explanation:
+                st.markdown(f"- {b}")
+
+            # Disclaimer breve
+            st.caption("Nota: estas señales son condicionales y basadas en reglas simples. No constituyen asesoramiento financiero. Revísalas con más análisis antes de tomar decisiones.")
+
+
+        #################################
+
+
+
+
         # Construir addplots
         apds = []
 
@@ -457,17 +623,17 @@ def render_technical_module(start_date, end_date, periodicity):
             ax_price = axes[0]
 
             # Pintar la nube Ichimoku (SenkouA/SenkouB) sobre ax_price (solo donde ambas series no-nulas)
-            sa = df_ind.get("ICH_Senkou_A")
-            sb = df_ind.get("ICH_Senkou_B")
-            if sa is not None and sb is not None:
-                mask_valid = (~sa.isna()) & (~sb.isna())
-                if mask_valid.any():
-                    ax_price.fill_between(dft.index, sa, sb,
-                                        where=(mask_valid & (sa >= sb)),
-                                        interpolate=True, color='lightgreen', alpha=0.12)
-                    ax_price.fill_between(dft.index, sa, sb,
-                                        where=(mask_valid & (sa < sb)),
-                                        interpolate=True, color='lightcoral', alpha=0.12)
+            #sa = df_ind.get("ICH_Senkou_A")
+            #sb = df_ind.get("ICH_Senkou_B")
+            #if sa is not None and sb is not None:
+                #mask_valid = (~sa.isna()) & (~sb.isna())
+                #if mask_valid.any():
+                    #ax_price.fill_between(dft.index, sa, sb,
+                                        #where=(mask_valid & (sa >= sb)),
+                                        #interpolate=True, color='lightgreen', alpha=0.12)
+                    #ax_price.fill_between(dft.index, sa, sb,
+                                        #where=(mask_valid & (sa < sb)),
+                                        #interpolate=True, color='lightcoral', alpha=0.12)
 
             # Intentar añadir leyendas en cada panel (siempre que existan handles)
             try:
