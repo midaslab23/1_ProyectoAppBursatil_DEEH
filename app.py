@@ -14,6 +14,15 @@ from ta.volume import OnBalanceVolumeIndicator
 from ta.trend import SMAIndicator, EMAIndicator, MACD, CCIIndicator, ADXIndicator
 from ta.momentum import RSIIndicator, StochasticOscillator
 
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+import yfinance as yf
+from datetime import datetime, date
+import math
+
 # -------------------- CONFIG / Parámetros globales (fácil de editar) --------------------
 CONFIG = {
     "DEFAULT_TICKERS": ["NVDA.MX", "META.MX", "GM.MX"],
@@ -139,7 +148,7 @@ def main():
     if module == "Análisis técnico":
         render_technical_module(start_date, end_date, periodicity)
     elif module == "Optimización + Simulación":
-        st.info("Módulo de optimización y simulación todavía no implementado")
+        render_optimization_module()
     elif module == "Pronóstico ML":
         st.info("Módulo de pronóstico ML aún no implementado (próximamente)")
 
@@ -659,6 +668,397 @@ def render_technical_module(start_date, end_date, periodicity):
 
         with st.expander("Ver datos (primeras filas)"):
             st.dataframe(dft.head())
+
+# -------------------- Módulo: Optimización + Simulación --------------------
+
+# Reutiliza download_ticker si ya existe en tu app; si no, usa este fallback:
+def safe_download_prices(tickers, start, end, interval="1d"):
+    try:
+        # intentamos usar tu helper si existe
+        df = download_ticker(tickers[0], start=start, end=end, interval=interval)
+        # si existe download_ticker debería devolver df por ticker; pero para simplicidad usamos yf.download
+    except Exception:
+        pass
+    # fallback a yfinance bulk (menos robusto, pero funciona)
+    df = yf.download(tickers, start=start, end=end, interval=interval, auto_adjust=True)["Close"]
+    # asegurar DataFrame con columnas tickers
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+    return df.ffill().dropna(axis=1, how="all")
+
+# Métricas y helpers (adaptadas de tu tesis)
+def compute_metrics(returns_series, rf_annual=0.0):
+    arr = np.asarray(returns_series)
+    out = {'ann_return': np.nan, 'ann_vol': np.nan, 'sharpe': np.nan, 'sortino': np.nan, 'max_drawdown': np.nan,
+           'total_return': np.nan, 'ann_return_geom': np.nan}
+    if arr.size == 0:
+        return out
+
+    n = len(arr)
+    # total acumulado sobre el periodo
+    total = np.prod(1 + arr) - 1
+    out['total_return'] = total
+
+    # annualizado geométrico (si n>0)
+    if n > 0:
+        out['ann_return'] = np.mean(arr) * 252  # aproximación
+        out['ann_return_geom'] = (1 + total)**(252.0 / n) - 1
+    # volatilidad (ann)
+    ann_vol = np.std(arr, ddof=0) * math.sqrt(252)
+    out['ann_vol'] = ann_vol
+
+    # Sharpe (usando ann_return geométrica o aritmética; usamos geométrica por robustez)
+    rf_ann = rf_annual if rf_annual is not None else 0.0
+    if ann_vol > 0:
+        out['sharpe'] = (out['ann_return_geom'] - rf_ann) / ann_vol
+    else:
+        out['sharpe'] = np.nan
+
+    # Sortino
+    downside = arr[arr < 0]
+    if len(downside) > 1:
+        dd_std = np.std(downside, ddof=0) * math.sqrt(252)
+        out['sortino'] = (out['ann_return_geom'] - rf_ann) / dd_std if dd_std > 0 else np.nan
+    else:
+        out['sortino'] = np.nan
+
+    # Max drawdown (sobre wealth)
+    wealth = np.cumprod(1 + arr) if n>0 else np.array([])
+    if wealth.size>0:
+        peak = np.maximum.accumulate(wealth)
+        drawdowns = (peak - wealth) / peak
+        out['max_drawdown'] = drawdowns.max()
+    else:
+        out['max_drawdown'] = np.nan
+
+    return out
+
+
+def normalize_weights(s):
+    s = s.fillna(0.0).astype(float)
+    total = s.sum()
+    if total == 0 or np.isnan(total):
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    return (s / total).fillna(0.0)
+
+# Optimizadores clásicos (con restricciones 0..1 y suma 1)
+def optimize_min_variance(returns_df):
+    cov = returns_df.cov().values
+    n = cov.shape[0]
+    def fun(w): return w.dot(cov).dot(w)
+    x0 = np.ones(n)/n
+    bounds = [(0.0,1.0)] * n
+    cons = ({'type':'eq', 'fun': lambda x: np.sum(x) - 1.0},)
+    res = minimize(fun, x0, method='SLSQP', bounds=bounds, constraints=cons, options={'maxiter':10000})
+    w = np.maximum(res.x, 0)
+    if w.sum() > 0:
+        w = w / w.sum()
+    return pd.Series(w, index=returns_df.columns)
+
+def optimize_max_sharpe(returns_df, rf_daily=0.0):
+    n = returns_df.shape[1]
+    mu = returns_df.mean().values
+    cov = returns_df.cov().values
+    def neg_sharpe(w):
+        port_ret = np.dot(mu, w)
+        port_vol = np.sqrt(w.dot(cov).dot(w))
+        if port_vol==0: return 1e9
+        # annualize inside outside handled in metrics; for optimization it's fine
+        return - (port_ret - rf_daily) / port_vol
+    x0 = np.ones(n)/n
+    bounds = [(0.0,1.0)]*n
+    cons = ({'type':'eq', 'fun': lambda x: np.sum(x)-1.0},)
+    res = minimize(neg_sharpe, x0, method='SLSQP', bounds=bounds, constraints=cons, options={'maxiter':1000})
+    w = np.maximum(res.x, 0)
+    if w.sum()>0: w = w / w.sum()
+    return pd.Series(w, index=returns_df.columns)
+
+def optimize_max_return(returns_df):
+    # asigna peso 1 al asset con mayor mean return in-sample
+    mean_ret = (1 + returns_df).prod() - 1
+    best = mean_ret.idxmax()
+    s = pd.Series(0.0, index=returns_df.columns); s.loc[best] = 1.0
+    return s
+
+# Backtest OOS helper
+def backtest_weights_on_returns(weights, returns_oos):
+    w = weights.reindex(returns_oos.columns).fillna(0.0)
+    if w.sum() <= 0: 
+        return np.zeros(len(returns_oos))
+    w = w / w.sum()
+    port_ret = returns_oos.values.dot(w.values)
+    return port_ret
+
+# Montecarlo frontier quick (opcional)
+def montecarlo_frontier(returns_df, n_sim=5000):
+    mu = returns_df.mean().values
+    cov = returns_df.cov().values
+    n = len(mu)
+    res = []
+    for i in range(n_sim):
+        w = np.random.random(n)
+        w = w / w.sum()
+        r = np.dot(mu, w) * 252
+        vol = np.sqrt(w.dot(cov).dot(w)) * math.sqrt(252)
+        res.append((r, vol, w))
+    df = pd.DataFrame([{'ret':r,'vol':v,'w':w} for r,v,w in res])
+    return df
+
+# Main render function
+def render_optimization_module():
+    st.title("Optimización de portafolio + Simulación")
+    st.write("Optimiza pesos in-sample y evalúa en periodo OOS. Selecciona parámetros y haz run.")
+
+    today_dt = pd.to_datetime(date.today())
+
+    # UI inputs
+    available = st.session_state.get('global_params', {}).get('available_tickers', CONFIG['DEFAULT_TICKERS'])
+    tickers = st.multiselect("Select tickers:", options=available, default=available[:8])
+
+    # fechas: start, opt_end (in-sample last day), test_end (OOS last day)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        start = st.date_input("Start date", value=(today_dt - pd.Timedelta(days=365*2)).date())
+    with col2:
+        opt_end = st.date_input("Opt (in-sample) end date", value=(today_dt - pd.Timedelta(days=90)).date())
+    with col3:
+        test_end = st.date_input("Test (OOS) end date", value=today_dt.date())
+
+    rf_pct = st.number_input("Tasa libre de riesgo anual (%)", value=9.0, min_value=0.0, max_value=100.0, step=0.1)
+    # benchmark
+    benchmark = st.text_input("Benchmark (ej. ^GSPC o ^MXX)", value='^MXX')
+
+    rf_annual = rf_pct / 100.0
+    trading_days = 252  # fijo
+
+    # Validaciones básicas
+    if pd.to_datetime(test_end) > today_dt:
+        st.error("La fecha test_end no puede ser mayor a hoy.")
+        return
+    if pd.to_datetime(opt_end) >= pd.to_datetime(test_end):
+        st.error("opt_end debe ser anterior a test_end y dejar espacio para OOS.")
+        return
+    min_oos_days = 20
+    if (pd.to_datetime(test_end) - pd.to_datetime(opt_end)).days < min_oos_days:
+        st.warning(f"Recomendado: al menos {min_oos_days} días OOS para evaluar. Ajusta las fechas si puedes.")
+
+    if not tickers:
+        st.info("Selecciona al menos un ticker.")
+        return
+
+    run = st.button("Ejecutar optimización y backtest")
+    if not run:
+        return
+
+    # Descargar precios hasta test_end
+    with st.spinner("Descargando precios..."):
+        start_s = pd.to_datetime(start).strftime("%Y-%m-%d")
+        test_end_s = pd.to_datetime(test_end).strftime("%Y-%m-%d")
+        opt_end_s = pd.to_datetime(opt_end).strftime("%Y-%m-%d")
+        prices = safe_download_prices(tickers, start=start_s, end=test_end_s, interval="1d")
+    if prices.empty:
+        st.error("No se descargaron precios. Revisa tickers/fechas.")
+        return
+
+    # Rendimientos diarios
+    returns = prices.pct_change().dropna(how='all')
+    if returns.empty:
+        st.error("No hay rendimientos calculables con los datos descargados.")
+        return
+
+    # Definir in-sample (hasta opt_end) y OOS
+    opt_end_dt = pd.to_datetime(opt_end_s)
+    train_returns = returns.loc[:opt_end_dt].copy()
+    test_start_idx = returns.index[returns.index > opt_end_dt]
+    if len(test_start_idx)==0:
+        st.error("No hay datos OOS posteriores a opt_end. Ajusta fechas.")
+        return
+    oos_returns = returns.loc[test_start_idx.min(): pd.to_datetime(test_end_s)].copy()
+
+    st.write(f"In-sample rows: {len(train_returns)} — OOS rows: {len(oos_returns)}")
+
+    # Si lookback (opcional) usar último año dentro del insample
+    lookback_days = trading_days  # 1 año
+    if len(train_returns) >= lookback_days:
+        train_for_est = train_returns.iloc[-lookback_days:]
+    else:
+        train_for_est = train_returns.copy()
+
+    # Filtrar activos con suficiente data
+    min_obs = int(0.5 * len(train_for_est))
+    valid_cols = [c for c in train_for_est.columns if train_for_est[c].dropna().shape[0] >= min_obs]
+    if len(valid_cols) == 0:
+        st.error("No hay tickers con suficientes observaciones en in-sample. Ajusta selección/fechas.")
+        return
+    train_for_est = train_for_est[valid_cols].copy()
+    oos_returns = oos_returns[valid_cols].copy()
+
+    # Estrategias a correr
+    strategies = {}
+    strategies['Equal'] = pd.Series(1.0/len(train_for_est.columns), index=train_for_est.columns)
+    strategies['MinVar'] = optimize_min_variance(train_for_est)
+    strategies['MaxSharpe'] = optimize_max_sharpe(train_for_est, rf_daily=rf_annual/252)
+    strategies['MaxReturn'] = optimize_max_return(train_for_est)
+    # Sortino/Sharpe via criteria (use optimizer on neg metrics) - we include SR as maxSharpe already; for Sortino use simple optimize on SOR criterion:
+    def sor_obj(w, data):
+        pr = np.dot(data.values, w)
+        mean = pr.mean()
+        downside = pr[pr < 0]
+        if len(downside) > 1:
+            dd_std = np.std(downside, ddof=0)
+            return - (mean / dd_std)
+        else:
+            return 1e6
+    def optimize_custom(objfn, data):
+        n = data.shape[1]
+        x0 = np.ones(n)/n
+        bounds = [(0.0,1.0)]*n
+        cons = ({'type':'eq','fun': lambda x: np.sum(x)-1.0},)
+        res = minimize(lambda x: objfn(x, data), x0, method='SLSQP', bounds=bounds, constraints=cons, options={'maxiter':1000})
+        w = np.maximum(res.x, 0)
+        if w.sum()>0: w = w / w.sum()
+        return pd.Series(w, index=data.columns)
+    try:
+        strategies['Sortino'] = optimize_custom(sor_obj, train_for_est)
+    except Exception:
+        strategies['Sortino'] = strategies['Equal']
+
+    # Normalizar y asegurar long-only
+    for k in list(strategies.keys()):
+        strategies[k] = normalize_weights(strategies[k]).reindex(train_for_est.columns).fillna(0.0)
+
+    # Backtest OOS
+    results = {}
+    metrics = []
+    for name, w in strategies.items():
+        port_ret = backtest_weights_on_returns(w, oos_returns)
+        results[name] = port_ret
+        m = compute_metrics(port_ret, rf_annual=rf_annual)
+        m['name'] = name
+        metrics.append(m)
+
+    
+    # Descargar benchmark y alinear de forma segura con oos_returns.index
+    try:
+        bench_df = yf.download(benchmark, start=oos_returns.index.min().strftime("%Y-%m-%d"),
+                            end=(oos_returns.index.max()+pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                            auto_adjust=True)["Close"]
+        if isinstance(bench_df, pd.Series):
+            bench_prices = bench_df
+        else:
+            bench_prices = bench_df.ffill().bfill()
+
+        # Reindexar al índice OOS y forward-fill/backfill (NO poner ceros)
+        bench_prices = bench_prices.reindex(oos_returns.index).ffill().bfill()
+
+        # Calcular retornos diarios alineados con OOS (dropna del primero)
+        bench_ret = bench_prices.pct_change().loc[oos_returns.index].fillna(0.0).values
+        results['Benchmark'] = bench_ret
+        bm = compute_metrics(bench_ret, rf_annual=rf_annual); bm['name']='Benchmark'; metrics.append(bm)
+    except Exception as e:
+        st.warning(f"No se pudo descargar/alinear benchmark {benchmark}: {e}")
+
+    metrics_df = pd.DataFrame(metrics).set_index('name')
+    # Mostrar métricas
+    st.subheader("Resumen métricas (OOS)")
+    st.dataframe(metrics_df.style.format({
+        'ann_return': '{:.2%}', 'ann_vol': '{:.2%}', 'sharpe': '{:.3f}', 'sortino': '{:.3f}', 'max_drawdown': '{:.2%}', 'total_return': '{:.2%}', 'ann_return_geom': '{:.2%}'
+    }))
+
+    st.caption("""Notas: Las métricas presentadas reflejan el rendimiento fuera de muestra (OOS) de cada estrategia optimizada.  
+               ann_return: retorno anualizado; ann_vol: volatilidad anualizada; sharpe: ratio de Sharpe; sortino: ratio de Sortino; max_drawdown: máxima caída desde un pico; total_return: retorno total en el periodo OOS; ann_return_geom: retorno anualizado geométrico.""")
+
+
+    # Gráficos dark style y equity curves
+    plt.style.use('dark_background')
+    rc = {
+        'axes.facecolor': '#222222', 'figure.facecolor':'#222222', 'axes.edgecolor': '#444444',
+        'grid.color': '#333333', 'xtick.color': 'white', 'ytick.color': 'white',
+    }
+    plt.rcParams.update(rc)
+
+    st.subheader("Simulación de estrategias - OOS (Rendimiento real)")
+    fig, ax = plt.subplots(figsize=(14,6))
+    from matplotlib.ticker import PercentFormatter
+    for name, arr in results.items():
+        cum_wealth = np.cumprod(1 + arr) - 1
+        if name == 'Benchmark':
+            ax.plot(oos_returns.index, cum_wealth, label=name, linewidth=2.2, linestyle='--', color='white')
+        else:
+            ax.plot(oos_returns.index, cum_wealth, label=name, linewidth=1.4)
+    # Formatear eje Y como porcentaje (cum_wealth está en fracción, p.ej. 0.10 -> 10%)
+    ax.axhline(0, color='red', linewidth=0.5, linestyle='--')
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.set_title("Equity curves (OOS)")
+    ax.legend(loc='upper left', fontsize='small')
+    ax.grid(alpha=0.3)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    st.caption("""Notas: la gráfica muestra la evolución del capital (equity curve) de cada estrategia durante el período fuera de muestra. 
+               En otras palabras, refleja el rendimiento real que habrían tenido las estrategias optimizadas aplicadas a datos no vistos durante la optimización.  
+               El rendimiento real puede diferir de las expectativas in-sample debido a la variabilidad del mercado y otros factores.  
+               Las estrategias optimizadas no garantizan rendimientos futuros.""")
+
+
+    # Pesos por estrategia (tabla)
+    st.subheader("Pesos por estrategia (in-sample)")
+    weights_df = pd.DataFrame({k: v for k,v in strategies.items()})
+    st.dataframe(weights_df.style.format("{:.2%}"))
+
+    #graficos de pastel de pesos
+    n = len(strategies)
+    cols = st.columns(3)  # 3 por fila
+    i = 0
+    for name, w in strategies.items():
+        fig, ax = plt.subplots(figsize=(3.5,3.5))
+        # evitar wedges tiny y etiquetas largas; filtrar zeros
+        w_nonzero = w[w > 0]
+        if w_nonzero.empty:
+            ax.text(0.5,0.5,"No weights", ha='center')
+        else:
+            ax.pie(w_nonzero.values, labels=w_nonzero.index, autopct=lambda p: f'{p:.1f}%', startangle=90, textprops={'fontsize':8})
+            ax.set_title(name, fontsize=10)
+        ax.axis('equal')
+        with cols[i % 3]:
+            st.pyplot(fig)
+        plt.close(fig)
+        i += 1
+
+
+    # Frontier via MonteCarlo (visual)
+    st.subheader("Frontera Eficiente (aproximada) - Método Monte Carlo")
+    mc = montecarlo_frontier(train_for_est, n_sim=1500)
+    fig2, ax2 = plt.subplots(figsize=(10,6))
+    ax2.scatter(mc['vol'], mc['ret'], s=8, alpha=0.3)
+    # plot strategies
+    for name, w in strategies.items():
+        re = np.dot(train_for_est.mean().values, w) * 252
+        vo = np.sqrt(w.values.dot(train_for_est.cov().values).dot(w.values)) * math.sqrt(252)
+        ax2.scatter(vo, re, s=60, label=name)
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax2.set_xlabel("Volatility (ann.)")
+    ax2.set_ylabel("Return (ann.)")
+    ax2.grid(alpha=0.3)
+    ax2.legend(fontsize='small')
+    st.pyplot(fig2, use_container_width=True)
+    plt.close(fig2)
+    st.caption("""Notas: la frontera Monte Carlo se calcula con datos In-Sample; las métricas OOS muestran el comportamiento real fuera de muestra.             
+    En otras palabras, es la frontera eficiente teórica. El comportamiento real está en las graficas OOS (out of sample).  
+    Las estrategias optimizadas no garantizan rendimientos futuros.""")
+
+
+    # Descargar pesos
+    csv_out = "optimized_weights_summary.csv"
+    df_for_export = weights_df.reset_index().rename(columns={'index':'Ticker'})
+    df_for_export.to_csv(csv_out, index=False)
+    st.download_button("Descargar pesos (CSV)", df_for_export.to_csv(index=False), file_name=csv_out, mime="text/csv")
+
+    st.success("Optimización y backtest completados.")
+
+
+
+
 
 # -------------------- Entrypoint --------------------
 if __name__ == '__main__':
